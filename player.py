@@ -39,9 +39,68 @@ OPENING_BOOK = {
 
 PIECE_VALUES = {'p': 1, 'n': 3, 'b': 3, 'r': 5, 'q': 9, 'k': 0}
 
+# Piece-square tables for positional evaluation (from white's perspective)
+_PAWN_TABLE = [
+     0,  0,  0,  0,  0,  0,  0,  0,
+    50, 50, 50, 50, 50, 50, 50, 50,
+    10, 10, 20, 30, 30, 20, 10, 10,
+     5,  5, 10, 25, 25, 10,  5,  5,
+     0,  0,  0, 20, 20,  0,  0,  0,
+     5, -5,-10,  0,  0,-10, -5,  5,
+     5, 10, 10,-20,-20, 10, 10,  5,
+     0,  0,  0,  0,  0,  0,  0,  0,
+]
+_KNIGHT_TABLE = [
+    -50,-40,-30,-30,-30,-30,-40,-50,
+    -40,-20,  0,  0,  0,  0,-20,-40,
+    -30,  0, 10, 15, 15, 10,  0,-30,
+    -30,  5, 15, 20, 20, 15,  5,-30,
+    -30,  0, 15, 20, 20, 15,  0,-30,
+    -30,  5, 10, 15, 15, 10,  5,-30,
+    -40,-20,  0,  5,  5,  0,-20,-40,
+    -50,-40,-30,-30,-30,-30,-40,-50,
+]
+_BISHOP_TABLE = [
+    -20,-10,-10,-10,-10,-10,-10,-20,
+    -10,  0,  0,  0,  0,  0,  0,-10,
+    -10,  0, 10, 10, 10, 10,  0,-10,
+    -10,  5,  5, 10, 10,  5,  5,-10,
+    -10,  0,  5, 10, 10,  5,  0,-10,
+    -10, 10, 10, 10, 10, 10, 10,-10,
+    -10,  5,  0,  0,  0,  0,  5,-10,
+    -20,-10,-10,-10,-10,-10,-10,-20,
+]
+_PST = {'p': _PAWN_TABLE, 'n': _KNIGHT_TABLE, 'b': _BISHOP_TABLE}
 
-def score_move_tactically(board, move):
+
+def _evaluate_position(board):
+    """Static evaluation from the perspective of the side to move.
+    Combines material count with piece-square positional bonuses."""
+    score = 0
+    for sq in chess.SQUARES:
+        piece = board.piece_at(sq)
+        if piece:
+            val = PIECE_VALUES.get(piece.symbol().lower(), 0) * 100
+            # Add positional bonus from piece-square tables
+            sym = piece.symbol().lower()
+            if sym in _PST:
+                if piece.color == chess.WHITE:
+                    val += _PST[sym][sq]
+                else:
+                    val += _PST[sym][chess.square_mirror(sq)]
+            if piece.color == board.turn:
+                score += val
+            else:
+                score -= val
+    return score
+
+
+def _evaluate_move_1ply(board, move):
+    """1-ply minimax: play our move, then check opponent's best reply.
+    Returns the evaluation after opponent plays their best response."""
     bonus = 0.0
+
+    # Immediate tactical rewards
     if board.is_capture(move):
         captured = board.piece_at(move.to_square)
         if captured:
@@ -50,20 +109,42 @@ def score_move_tactically(board, move):
             moving_val = PIECE_VALUES.get(moving.symbol().lower(), 0) if moving else 3
             bonus += captured_val * 3.0 + max(0, captured_val - moving_val)
         else:
-            bonus += 3.0
+            bonus += 3.0  # en passant
     if move.promotion:
         bonus += 8.0
         if move.promotion == chess.QUEEN:
             bonus += 2.0
+
     board.push(move)
+
+    # Terminal states
     if board.is_checkmate():
-        bonus += 100.0
-    elif board.is_check():
-        bonus += 2.0
-    if board.is_stalemate():
-        bonus -= 50.0
+        board.pop()
+        return 200.0  # we checkmated opponent
+    if board.is_stalemate() or board.is_insufficient_material():
+        board.pop()
+        return -30.0  # draws are bad if we're winning
+    if board.is_check():
+        bonus += 1.5
+
+    # Opponent's best reply (1-ply lookahead)
+    # Evaluate: after opponent plays their best move, what's our position?
+    best_opp_eval = float('-inf')  # best for opponent = worst for us
+    for opp_move in board.legal_moves:
+        board.push(opp_move)
+        # Evaluation from opponent's perspective (they just moved)
+        opp_eval = _evaluate_position(board)  # from perspective of side-to-move (us again)
+        opp_eval = -opp_eval  # flip: high opp_eval = good for opponent = bad for us
+        if opp_eval > best_opp_eval:
+            best_opp_eval = opp_eval
+        board.pop()
+
     board.pop()
-    return bonus
+
+    # After opponent's best reply, our position score (lower = worse for us)
+    # Scale the positional eval to blend with model logprobs
+    position_score = -best_opp_eval / 100.0  # normalize centipawns to ~pawn units
+    return bonus + position_score
 
 
 class TransformerPlayer(Player):
@@ -163,12 +244,12 @@ class TransformerPlayer(Player):
             prompt_output = self.model(prompt_tensor)
             base_logprobs = torch.log_softmax(prompt_output.logits[0, -1], dim=-1)
 
-        best_score = float("-inf")
-        best_move = None
+        board = chess.Board(fen)
+        scored_moves = []
 
         for move_obj, move_str in zip(legal_moves, legal_uci):
             move_ids = self.tokenizer.encode(move_str, add_special_tokens=False)
-            score = base_logprobs[move_ids[0]].item()
+            model_score = base_logprobs[move_ids[0]].item()
 
             if len(move_ids) > 1:
                 full_ids = prompt_token_ids + move_ids
@@ -179,17 +260,17 @@ class TransformerPlayer(Player):
                 for i in range(1, len(move_ids)):
                     pos = prompt_len + i - 1
                     token_logprob = torch.log_softmax(logits[0, pos], dim=-1)[move_ids[i]].item()
-                    score += token_logprob
+                    model_score += token_logprob
 
-            board = chess.Board(fen)
-            tactical_bonus = score_move_tactically(board, move_obj)
-            score += tactical_bonus
+            # 1-ply minimax: evaluate how good our position is after
+            # opponent plays their best response
+            tactical_score = _evaluate_move_1ply(board, move_obj)
 
-            if score > best_score:
-                best_score = score
-                best_move = move_str
+            total_score = model_score + tactical_score
+            scored_moves.append((total_score, move_str))
 
-        return best_move
+        scored_moves.sort(key=lambda x: x[0], reverse=True)
+        return scored_moves[0][1] if scored_moves else None
 
     def _constrained_decode(self, fen, legal_uci):
         if not self.has_lmfe:
