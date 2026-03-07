@@ -1,0 +1,8 @@
+transformers>=4.40.0
+torch>=2.0.0
+chess
+python-chess
+lm-format-enforcer>=0.10.0
+huggingface_hub
+accelerate
+git+https://github.com/bylinina/chess_exam.git
